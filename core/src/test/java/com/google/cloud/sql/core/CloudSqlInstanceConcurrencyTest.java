@@ -19,13 +19,33 @@ import java.util.concurrent.ExecutionException;
 import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledThreadPoolExecutor;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.logging.ConsoleHandler;
+import java.util.logging.Level;
+import java.util.logging.Logger;
+import java.util.logging.SimpleFormatter;
+import org.junit.BeforeClass;
 import org.junit.Test;
 
 import static com.google.common.truth.Truth.assertThat;
 
 public class CloudSqlInstanceConcurrencyTest {
 
+  private static final Logger logger = Logger.getLogger(
+      CloudSqlInstanceConcurrencyTest.class.getName());
+
+  static {
+    ConsoleHandler handler = new ConsoleHandler();
+    handler.setFormatter(new SimpleFormatter());
+    handler.setLevel(Level.ALL);
+    Logger.getLogger("").addHandler(handler);
+    Logger l = Logger.getLogger(CloudSqlInstance.class.getName());
+    l.setLevel(Level.ALL);
+    logger.info("Hello");
+  }
+
   private static class TestDataSupplier implements InstanceDataSupplier {
+
+    private final boolean flakey;
 
     private AtomicInteger counter = new AtomicInteger();
     private InstanceData response =
@@ -39,6 +59,11 @@ public class CloudSqlInstanceConcurrencyTest {
             new SslData(null, null, null),
             Date.from(Instant.now().plus(1, ChronoUnit.HOURS)));
 
+    private TestDataSupplier(boolean flakey) {
+      this.flakey = flakey;
+    }
+
+
     @Override
     public InstanceData getInstanceData(CloudSqlInstanceName instanceName,
         AccessTokenSupplier accessTokenSupplier, AuthType authType,
@@ -47,7 +72,7 @@ public class CloudSqlInstanceConcurrencyTest {
       int c = counter.incrementAndGet();
       Thread.sleep(100);
 
-      if (c % 2 == 0) {
+      if (flakey && c % 2 == 0) {
         throw new ExecutionException("Flaky", new Exception());
       }
 
@@ -69,22 +94,37 @@ public class CloudSqlInstanceConcurrencyTest {
 
   @Test
   public void testCloudSqlInstanceConcurrency() throws Exception {
+    // for (int i = 0; i < 10; i++) {
+      runConcurrencyTest();
+    // }
+  }
+
+
+  @Test
+  public void testBasicHappyPath() throws Exception {
     MockAdminApi mockAdminApi = new MockAdminApi();
     ListenableFuture<KeyPair> keyPairFuture = Futures.immediateFuture(
         mockAdminApi.getClientKeyPair());
     ListeningScheduledExecutorService executor = newTestExecutor();
-    TestDataSupplier supplier = new TestDataSupplier();
+    TestDataSupplier supplier = new TestDataSupplier(false);
+    CloudSqlInstance instance = new CloudSqlInstance("a:b:c", supplier, AuthType.PASSWORD,
+        new TestCredentialFactory(), executor, keyPairFuture);
+
+    assertThat(supplier.counter.get()).isEqualTo(0);
+    Thread.sleep(500);
+    SslData data = instance.getSslData();
+    assertThat(data).isNotNull();
+  }
+
+  public void runConcurrencyTest() throws Exception {
+    MockAdminApi mockAdminApi = new MockAdminApi();
+    ListenableFuture<KeyPair> keyPairFuture = Futures.immediateFuture(
+        mockAdminApi.getClientKeyPair());
+    ListeningScheduledExecutorService executor = newTestExecutor();
+    TestDataSupplier supplier = new TestDataSupplier(true);
     CloudSqlInstance instance = new CloudSqlInstance("a:b:c", supplier, AuthType.PASSWORD,
         new TestCredentialFactory(), executor, keyPairFuture);
     assertThat(supplier.counter.get()).isEqualTo(0);
-
-    // Call forceRefresh simultaneously
-    ListenableFuture<List<Object>> all = Futures.allAsList(
-        executor.submit(instance::forceRefresh),
-        executor.submit(instance::forceRefresh),
-        executor.submit(instance::forceRefresh));
-    all.get();
-
 
     // Attempt to retrieve data, ensure we wait for success
     ListenableFuture<List<Object>> allData = Futures.allAsList(
@@ -96,7 +136,14 @@ public class CloudSqlInstanceConcurrencyTest {
     assertThat(d.get(0)).isNotNull();
     assertThat(d.get(1)).isNotNull();
     assertThat(d.get(2)).isNotNull();
-    assertThat(supplier.counter.get()).isEqualTo(2);
+    assertThat(supplier.counter.get()).isEqualTo(1);
+
+    // Call forceRefresh simultaneously
+    ListenableFuture<List<Object>> all = Futures.allAsList(
+        executor.submit(instance::forceRefresh),
+        executor.submit(instance::forceRefresh),
+        executor.submit(instance::forceRefresh));
+    all.get();
 
     ListenableFuture<List<Object>> allData2 = Futures.allAsList(
         executor.submit(instance::getSslData),

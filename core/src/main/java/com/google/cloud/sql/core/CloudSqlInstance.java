@@ -22,15 +22,20 @@ import com.google.cloud.sql.CredentialFactory;
 import com.google.common.base.Throwables;
 import com.google.common.util.concurrent.Futures;
 import com.google.common.util.concurrent.ListenableFuture;
+import com.google.common.util.concurrent.ListenableScheduledFuture;
 import com.google.common.util.concurrent.ListeningScheduledExecutorService;
+import com.google.common.util.concurrent.MoreExecutors;
 import com.google.common.util.concurrent.Uninterruptibles;
 import com.google.errorprone.annotations.concurrent.GuardedBy;
 import dev.failsafe.RateLimiter;
 import java.io.IOException;
 import java.security.KeyPair;
+import java.security.Security;
 import java.time.Duration;
 import java.time.Instant;
 import java.time.temporal.ChronoUnit;
+import java.time.temporal.TemporalUnit;
+import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
@@ -38,6 +43,7 @@ import java.util.concurrent.ExecutionException;
 import java.util.concurrent.TimeUnit;
 import java.util.logging.Level;
 import java.util.logging.Logger;
+import java.util.stream.Collectors;
 import javax.net.ssl.SSLSocket;
 
 /**
@@ -56,22 +62,22 @@ class CloudSqlInstance {
   private final CloudSqlInstanceName instanceName;
   private final ListenableFuture<KeyPair> keyPair;
   private final Object instanceDataGuard = new Object();
-  // Limit forced refreshes to 1 every minute.
-  private final RateLimiter<Object> forcedRenewRateLimiter =
-      RateLimiter.burstyBuilder(2, Duration.ofSeconds(30)).build();
+  private final Object performRefreshGuard = new Object();
 
   private final RefreshCalculator refreshCalculator = new RefreshCalculator();
+  @GuardedBy("instanceDataGuard")
+  private volatile boolean refreshing;
 
   @GuardedBy("instanceDataGuard")
-  private ListenableFuture<InstanceData> currentInstanceData;
-
+  private InstanceData currentInstanceData;
   @GuardedBy("instanceDataGuard")
-  private ListenableFuture<InstanceData> nextInstanceData;
+  private Throwable lastThrowable;
 
   /**
    * Initializes a new Cloud SQL instance based on the given connection name.
    *
-   * @param connectionName instance connection name in the format "PROJECT_ID:REGION_ID:INSTANCE_ID"
+   * @param connectionName instance connection name in the format
+   *     "PROJECT_ID:REGION_ID:INSTANCE_ID"
    * @param instanceDataSupplier Service class for interacting with the Cloud SQL Admin API
    * @param executor executor used to schedule asynchronous tasks
    * @param keyPair public/private key pair used to authenticate connections
@@ -96,27 +102,60 @@ class CloudSqlInstance {
       this.accessTokenSupplier = Optional::empty;
     }
 
-    synchronized (instanceDataGuard) {
-      this.currentInstanceData = executor.submit(this::performRefresh);
-      this.nextInstanceData = currentInstanceData;
-    }
+    this.scheduleNextRefresh(null, null, Instant.now());
   }
 
   /**
-   * Returns the current data related to the instance from {@link #performRefresh()}. May block if
-   * no valid data is currently available.
+   * Returns the current data related to the instance from {@link #performRefresh(boolean)}. May
+   * block if no valid data is currently available.
    */
   private InstanceData getInstanceData() {
-    ListenableFuture<InstanceData> instanceDataFuture;
-    synchronized (instanceDataGuard) {
-      instanceDataFuture = currentInstanceData;
-    }
+    logger.fine("Getting instance data...");
     try {
-      return Uninterruptibles.getUninterruptibly(instanceDataFuture);
-    } catch (ExecutionException ex) {
-      Throwable cause = ex.getCause();
-      Throwables.throwIfUnchecked(cause);
-      throw new RuntimeException(cause);
+      Instant getDataTimeout = Instant.now().plus(10, ChronoUnit.SECONDS);
+      synchronized (performRefreshGuard) {
+        while ((refreshing == true || !isInstanceDataValid()) && Instant.now()
+            .isBefore(getDataTimeout)) {
+          performRefreshGuard.wait(1000);
+        }
+        // wait for any in-progress refresh to complete
+        logger.fine("At least one refresh has comleted");
+      }
+    } catch (InterruptedException e) {
+      // Safely ignore the interrupted exception. If this was interrupted, then
+      // continue, using the current state of instance data.
+    }
+
+    synchronized (instanceDataGuard) {
+      if (this.currentInstanceData == null) {
+        // if recent requests have failed...
+        if (this.lastThrowable != null) {
+          String msg = String.format(
+              "Certificate refresh failed for %s.",
+              instanceName.toString());
+          logger.log(Level.WARNING, msg, this.lastThrowable);
+          throw new RuntimeException(msg, this.lastThrowable);
+        }
+
+        // Otherwise, it was never set.
+        String msg = String.format(
+            "Certificate refresh for %s has never completed.",
+            instanceName.toString());
+        logger.warning(msg);
+        throw new RuntimeException(msg);
+      }
+
+      // if the data has expired
+      if (Instant.now().isAfter(this.currentInstanceData.getExpiration().toInstant())) {
+        String msg = String.format(
+            "Auth token for %s expired before at %s before it could be refreshed.",
+            instanceName.toString(), this.currentInstanceData.getExpiration().toString());
+        logger.warning(msg);
+        throw new RuntimeException(msg);
+      }
+
+      // the current data is OK
+      return this.currentInstanceData;
     }
   }
 
@@ -132,8 +171,8 @@ class CloudSqlInstance {
    * Returns the first IP address for the instance, in order of the preference supplied by
    * preferredTypes.
    *
-   * @param preferredTypes Preferred instance IP types to use. Valid IP types include "Public" and
-   *     "Private".
+   * @param preferredTypes Preferred instance IP types to use. Valid IP types include "Public"
+   *     and "Private".
    * @return returns a string representing the IP address for the instance
    * @throws IllegalArgumentException If the instance has no IP addresses matching the provided
    *     preferences.
@@ -158,21 +197,67 @@ class CloudSqlInstance {
    * been completed.
    */
   void forceRefresh() {
+    submitPerformRefresh(true);
+  }
+
+
+  private void scheduleNextRefresh(InstanceData data, Throwable error, Instant nextCycle) {
+    logger.fine(String.format("Scheduling refresh for %s at %s", this.instanceName, nextCycle));
     synchronized (instanceDataGuard) {
-      nextInstanceData.cancel(false);
-      if (nextInstanceData.isCancelled()) {
-        logger.fine(
-            "Force Refresh: the next refresh operation was cancelled."
-                + " Scheduling new refresh operation immediately.");
-        currentInstanceData = executor.submit(this::performRefresh);
-        nextInstanceData = currentInstanceData;
-      } else {
-        logger.fine(
-            "Force Refresh: the next refresh operation is already running."
-                + " Marking it as the current operation.");
-        // Otherwise it's already running, so just move next to current.
-        currentInstanceData = nextInstanceData;
+      // Always set/clear the lastThrowable error
+      this.lastThrowable = error;
+
+      // only update currentInstanceData on success
+      if (error == null) {
+        this.currentInstanceData = data;
       }
+
+      // schedule a task that will submitPerformRefresh() in the future
+      if (Instant.now().isBefore(nextCycle)) {
+        Duration d = Duration.between(Instant.now(), nextCycle);
+        long inMillis = d.toMillis();
+        ListenableScheduledFuture<?> t = executor.schedule(
+            () -> this.submitPerformRefresh(false), inMillis,
+            TimeUnit.MILLISECONDS);
+      } else {
+        submitPerformRefresh(false);
+      }
+    }
+    logger.fine(
+        String.format("Finished scheduling refresh for %s at %s", this.instanceName, nextCycle));
+  }
+
+  private void submitPerformRefresh(boolean force) {
+    synchronized (instanceDataGuard) {
+      if (force || this.isRefreshRequired()) {
+        ListenableFuture<InstanceData> t = executor.submit(() -> performRefresh(force));
+      }
+    }
+  }
+
+  private boolean isInstanceDataValid() {
+    synchronized (instanceDataGuard) {
+      // when there is no valid data
+      return this.currentInstanceData != null &&
+          Instant.now().isBefore(this.currentInstanceData.getExpiration().toInstant());
+    }
+
+  }
+
+  private boolean isRefreshRequired() {
+    synchronized (instanceDataGuard) {
+      // when there is no valid data
+      if (this.currentInstanceData == null) {
+        return true;
+      }
+
+      // when the certificate or access token is about to expire
+      if (refreshCalculator.needsRefresh(Instant.now(),
+          this.currentInstanceData.getExpiration().toInstant())) {
+        return true;
+      }
+
+      return false;
     }
   }
 
@@ -181,48 +266,63 @@ class CloudSqlInstance {
    * value of currentInstanceData and schedules the next refresh shortly before the information
    * would expire.
    */
-  private InstanceData performRefresh() throws InterruptedException, ExecutionException {
-    logger.fine("Refresh Operation: Acquiring rate limiter permit.");
-    // To avoid unreasonable SQL Admin API usage, use a rate limit to throttle our usage.
-    forcedRenewRateLimiter.acquirePermit();
-    logger.fine("Refresh Operation: Acquired rate limiter permit. Starting refresh...");
+  private InstanceData performRefresh(boolean force)
+      throws InterruptedException, ExecutionException {
+    logger.fine("Refresh Operation: Attempting refresh...");
 
-    try {
-      InstanceData data =
-          instanceDataSupplier.getInstanceData(
-              this.instanceName, this.accessTokenSupplier, this.authType, executor, keyPair);
-
-      logger.fine(
-          String.format(
-              "Refresh Operation: Completed refresh with new certificate expiration at %s.",
-              data.getExpiration().toInstant().toString()));
-      long secondsToRefresh =
-          refreshCalculator.calculateSecondsUntilNextRefresh(
-              Instant.now(), data.getExpiration().toInstant());
-
-      logger.fine(
-          String.format(
-              "Refresh Operation: Next operation scheduled at %s.",
-              Instant.now()
-                  .plus(secondsToRefresh, ChronoUnit.SECONDS)
-                  .truncatedTo(ChronoUnit.SECONDS)
-                  .toString()));
-
+    synchronized (performRefreshGuard) {
+      // if this is not forced refresh, and currentInstanceData is set, and currentInstanceData doesn't
+      // need to be refreshed, then balk and do nothing.
       synchronized (instanceDataGuard) {
-        currentInstanceData = Futures.immediateFuture(data);
-        nextInstanceData =
-            executor.schedule(this::performRefresh, secondsToRefresh, TimeUnit.SECONDS);
+        this.refreshing = true;
+        if (!force && !isRefreshRequired()) {
+          logger.fine(
+              "Refresh Operation: Ignoring refresh attempt, token refresh is not required.");
+          return this.currentInstanceData;
+        }
       }
 
-      return data;
-    } catch (ExecutionException | InterruptedException e) {
-      logger.log(
-          Level.FINE, "Refresh Operation: Failed! Starting next refresh operation immediately.", e);
-      synchronized (instanceDataGuard) {
-        nextInstanceData = executor.submit(this::performRefresh);
+      logger.fine("Refresh Operation: Acquiring rate limiter permit.");
+      // To avoid unreasonable SQL Admin API usage, use a rate limit to throttle our usage.
+      // forcedRenewRateLimiter.acquirePermit();
+      logger.fine("Refresh Operation: Acquired rate limiter permit. Starting refresh...");
+
+      try {
+        InstanceData data =
+            instanceDataSupplier.getInstanceData(
+                this.instanceName, this.accessTokenSupplier, this.authType, executor, keyPair);
+
+        logger.fine(
+            String.format(
+                "Refresh Operation: Completed refresh with new certificate expiration at %s.",
+                data.getExpiration().toInstant().toString()));
+        long secondsToRefresh =
+            refreshCalculator.calculateSecondsUntilNextRefresh(
+                Instant.now(), data.getExpiration().toInstant());
+
+        logger.fine(
+            String.format(
+                "Refresh Operation: Next operation scheduled at %s.",
+                Instant.now()
+                    .plus(secondsToRefresh, ChronoUnit.SECONDS)
+                    .truncatedTo(ChronoUnit.SECONDS)
+                    .toString()));
+        scheduleNextRefresh(data, null, Instant.now().plus(secondsToRefresh, ChronoUnit.SECONDS));
+        return data;
+      } catch (Exception e) {
+        logger.log(
+            Level.FINE, "Refresh Operation: Failed! Starting next refresh operation immediately.",
+            e);
+        scheduleNextRefresh(null, e, Instant.now());
+        throw e;
+      } finally {
+        synchronized (instanceDataGuard) {
+          refreshing = false;
+        }
+        performRefreshGuard.notifyAll();
       }
-      throw e;
     }
+
   }
 
   SslData getSslData() {

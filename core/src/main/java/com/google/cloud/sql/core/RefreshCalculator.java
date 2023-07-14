@@ -29,6 +29,9 @@ class RefreshCalculator {
   // certificate must be valid to ensure the next refresh attempt has adequate
   // time to complete.
   private static final Duration DEFAULT_REFRESH_BUFFER = Duration.ofMinutes(4);
+  boolean needsRefresh(Instant now, Instant expiration) {
+    return now.plus(DEFAULT_REFRESH_BUFFER).isAfter(expiration);
+  }
 
   long calculateSecondsUntilNextRefresh(Instant now, Instant expiration) {
     Duration timeUntilExp = Duration.between(now, expiration);
