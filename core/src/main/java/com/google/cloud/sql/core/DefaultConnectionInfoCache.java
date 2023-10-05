@@ -148,4 +148,8 @@ class DefaultConnectionInfoCache {
   public CloudSqlInstanceName getInstanceName() {
     return instanceName;
   }
+
+  void close() {
+    refresher.close();
+  }
 }

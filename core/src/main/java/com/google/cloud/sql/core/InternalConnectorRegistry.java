@@ -57,6 +57,9 @@ public final class InternalConnectorRegistry {
   private static InternalConnectorRegistry internalConnectorRegistry;
   private final ListenableFuture<KeyPair> localKeyPair;
   private final ConcurrentHashMap<ConnectorKey, Connector> connectors = new ConcurrentHashMap<>();
+  private final ConcurrentHashMap<String, ConnectionConfig> namedConfigs =
+      new ConcurrentHashMap<>();
+  private final ConcurrentHashMap<String, Connector> namedConnectors = new ConcurrentHashMap<>();
   private final ListeningScheduledExecutorService executor;
   private final CredentialFactory credentialFactory;
   private final int serverProxyPort;
@@ -131,11 +134,13 @@ public final class InternalConnectorRegistry {
    *
    * <p>Depending on the given properties, it may return either a SSL Socket or a Unix Socket.
    *
-   * @param config Configuration used to configure the connection.
+   * @param config used to configure the connection.
    * @return the newly created Socket.
    * @throws IOException if error occurs during socket creation.
    */
   public Socket connect(ConnectionConfig config) throws IOException, InterruptedException {
+    config = resolveConfig(config);
+
     // Validate parameters
     Preconditions.checkArgument(
         config.getCloudSqlInstance() != null,
@@ -146,6 +151,7 @@ public final class InternalConnectorRegistry {
   }
 
   public ConnectionMetadata getConnectionMetadata(ConnectionConfig config) throws IOException {
+    config = resolveConfig(config);
     return getConnector(config).getConnection(config).getConnectionMetadata(refreshTimeoutMs);
   }
 
@@ -227,6 +233,11 @@ public final class InternalConnectorRegistry {
   }
 
   private Connector getConnector(ConnectionConfig config) {
+    if (config.getNamedConnection() != null) {
+      ConnectionConfig realConfig = resolveConfig(config);
+      return namedConnectors.computeIfAbsent(
+          config.getNamedConnection(), k -> createConnector(realConfig));
+    }
     return connectors.computeIfAbsent(new ConnectorKey(config), k -> createConnector(config));
   }
 
@@ -260,5 +271,54 @@ public final class InternalConnectorRegistry {
         MIN_REFRESH_DELAY_MS,
         refreshTimeoutMs,
         serverProxyPort);
+  }
+
+  private ConnectionConfig resolveConfig(ConnectionConfig config) {
+    if (config.getNamedConnection() != null) {
+      ConnectionConfig namedConfig = namedConfigs.get(config.getNamedConnection());
+      if (namedConfig == null) {
+        throw new IllegalArgumentException(
+            "No named connection named " + config.getNamedConnection());
+      }
+      return namedConfig;
+    }
+    return config;
+  }
+
+  /** Register the configuration for a named connector. */
+  public void register(String name, ConnectionConfig config) {
+    ConnectionConfig oldConfig = this.namedConfigs.putIfAbsent(name, config);
+    if (oldConfig != null) {
+      throw new IllegalArgumentException("Named configuration " + name + " already exists.");
+    }
+  }
+
+  /** Close a named connector, stopping the refresh process and removing it from the registry. */
+  public void close(String name) {
+    this.namedConnectors.remove(name);
+    Connector oldConnector = this.namedConnectors.remove(name);
+    ConnectionConfig oldConfig = this.namedConfigs.remove(name);
+    if (oldConnector == null && oldConfig == null) {
+      throw new IllegalArgumentException("Named configuration " + name + " does not exist.");
+    }
+    if (oldConnector != null) {
+      // oldInstance == null when a config is registered but never used.
+      oldConnector.close();
+    }
+  }
+
+  /** Shutdown all connectors. */
+  public void shutdown() {
+    this.namedConnectors.forEach(
+        (key, c) -> {
+          c.close();
+        });
+    this.namedConnectors.clear();
+    this.connectors.forEach(
+        (key, c) -> {
+          c.close();
+        });
+    this.connectors.clear();
+    this.executor.shutdown();
   }
 }

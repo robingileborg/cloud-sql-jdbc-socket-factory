@@ -127,4 +127,9 @@ class Connector {
     return new DefaultConnectionInfoCache(
         config, adminApi, instanceCredentialFactory, executor, localKeyPair, minRefreshDelayMs);
   }
+
+  public void close() {
+    this.instances.forEach((key, c) -> c.close());
+    this.instances.clear();
+  }
 }

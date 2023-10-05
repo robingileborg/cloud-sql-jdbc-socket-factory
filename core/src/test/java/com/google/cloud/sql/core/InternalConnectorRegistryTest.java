@@ -34,6 +34,7 @@ import java.net.Socket;
 import java.time.Duration;
 import java.time.Instant;
 import java.util.Arrays;
+import java.util.Properties;
 import org.junit.After;
 import org.junit.Before;
 import org.junit.Test;
@@ -365,6 +366,107 @@ public class InternalConnectorRegistryTest extends CloudSqlCoreTestingBase {
     assertThrows(
         IllegalStateException.class,
         () -> InternalConnectorRegistry.setApplicationName("sample-app"));
+  }
+
+  @Test
+  public void registerConnection() throws IOException, InterruptedException {
+    FakeSslServer sslServer = new FakeSslServer();
+    int port = sslServer.start(PUBLIC_IP);
+    ConnectionInfoRepositoryFactory factory =
+        new StubConnectionInfoRepositoryFactory(fakeSuccessHttpTransport(Duration.ofSeconds(0)));
+    InternalConnectorRegistry coreSocketFactory =
+        new InternalConnectorRegistry(
+            clientKeyPair, factory, credentialFactory, port, TEST_MAX_REFRESH_MS, defaultExecutor);
+    // Register a ConnectionConfig named "my-connection"
+    ConnectionConfig real =
+        new ConnectionConfig.Builder()
+            .withCloudSqlInstance("myProject:myRegion:myInstance")
+            .withIpTypes("PRIMARY")
+            .build();
+    coreSocketFactory.register("my-connection", real);
+    // Attempt to connect using the cloudSqlNamedConnection connection property
+    Properties connProps = new Properties();
+    connProps.setProperty(ConnectionConfig.CLOUD_SQL_NAMED_CONNECTION_PROPERTY, "my-connection");
+    ConnectionConfig namedConfig = ConnectionConfig.fromConnectionProperties(connProps);
+    Socket socket = coreSocketFactory.connect(namedConfig);
+    // Assert that the socket opens correctly.
+    assertThat(readLine(socket)).isEqualTo(SERVER_MESSAGE);
+  }
+
+  @Test
+  public void registerConnectionFailsWithDuplicateName() throws InterruptedException {
+    FakeSslServer sslServer = new FakeSslServer();
+    int port = sslServer.start(PUBLIC_IP);
+    ConnectionInfoRepositoryFactory factory =
+        new StubConnectionInfoRepositoryFactory(fakeSuccessHttpTransport(Duration.ofSeconds(0)));
+    InternalConnectorRegistry registry =
+        new InternalConnectorRegistry(
+            clientKeyPair, factory, credentialFactory, port, TEST_MAX_REFRESH_MS, defaultExecutor);
+    // Register a ConnectionConfig named "my-connection"
+    ConnectionConfig real =
+        new ConnectionConfig.Builder()
+            .withCloudSqlInstance("myProject:myRegion:myInstance")
+            .withIpTypes("PRIMARY")
+            .build();
+    registry.register("my-connection", real);
+    assertThrows(IllegalArgumentException.class, () -> registry.register("my-connection", real));
+  }
+
+  @Test
+  public void closeNamedConnectionFailsWhenNotFound() throws InterruptedException {
+    FakeSslServer sslServer = new FakeSslServer();
+    int port = sslServer.start(PUBLIC_IP);
+    ConnectionInfoRepositoryFactory factory =
+        new StubConnectionInfoRepositoryFactory(fakeSuccessHttpTransport(Duration.ofSeconds(0)));
+    InternalConnectorRegistry registry =
+        new InternalConnectorRegistry(
+            clientKeyPair, factory, credentialFactory, port, TEST_MAX_REFRESH_MS, defaultExecutor);
+    assertThrows(IllegalArgumentException.class, () -> registry.close("my-connection"));
+  }
+
+  @Test
+  public void closeNamedConnection() throws InterruptedException {
+    FakeSslServer sslServer = new FakeSslServer();
+    int port = sslServer.start(PUBLIC_IP);
+    ConnectionInfoRepositoryFactory factory =
+        new StubConnectionInfoRepositoryFactory(fakeSuccessHttpTransport(Duration.ofSeconds(0)));
+    InternalConnectorRegistry registry =
+        new InternalConnectorRegistry(
+            clientKeyPair, factory, credentialFactory, port, TEST_MAX_REFRESH_MS, defaultExecutor);
+    // Register a ConnectionConfig named "my-connection"
+    ConnectionConfig real =
+        new ConnectionConfig.Builder()
+            .withCloudSqlInstance("myProject:myRegion:myInstance")
+            .withIpTypes("PRIMARY")
+            .build();
+    registry.register("my-connection", real);
+    // Close the named connection.
+    registry.close("my-connection");
+    // Attempt and fail to connect using the cloudSqlNamedConnection connection property
+    Properties connProps = new Properties();
+    connProps.setProperty(ConnectionConfig.CLOUD_SQL_NAMED_CONNECTION_PROPERTY, "my-connection");
+    ConnectionConfig namedConfig = ConnectionConfig.fromConnectionProperties(connProps);
+    IllegalArgumentException ex =
+        assertThrows(IllegalArgumentException.class, () -> registry.connect(namedConfig));
+    assertThat(ex).hasMessageThat().contains("No named connection named my-connection");
+  }
+
+  @Test
+  public void connectFailsOnUnknownNamedConnection() throws InterruptedException {
+    FakeSslServer sslServer = new FakeSslServer();
+    int port = sslServer.start(PUBLIC_IP);
+    ConnectionInfoRepositoryFactory factory =
+        new StubConnectionInfoRepositoryFactory(fakeSuccessHttpTransport(Duration.ofSeconds(0)));
+    InternalConnectorRegistry registry =
+        new InternalConnectorRegistry(
+            clientKeyPair, factory, credentialFactory, port, TEST_MAX_REFRESH_MS, defaultExecutor);
+    // Attempt and fail to connect using the cloudSqlNamedConnection connection property
+    Properties connProps = new Properties();
+    connProps.setProperty(ConnectionConfig.CLOUD_SQL_NAMED_CONNECTION_PROPERTY, "my-connection");
+    ConnectionConfig namedConfig = ConnectionConfig.fromConnectionProperties(connProps);
+    IllegalArgumentException ex =
+        assertThrows(IllegalArgumentException.class, () -> registry.connect(namedConfig));
+    assertThat(ex).hasMessageThat().contains("No named connection named my-connection");
   }
 
   private String readLine(Socket socket) throws IOException {

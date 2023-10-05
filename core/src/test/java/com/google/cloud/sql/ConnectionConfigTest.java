@@ -29,6 +29,7 @@ public class ConnectionConfigTest {
   @Test
   public void testConfigFromProps() {
     final String wantCsqlInstance = "proj:region:inst";
+    final String wantNamedConnection = "my-connection";
     final String wantTargetPrincipal = "test@example.com";
     final List<String> wantDelegates = Arrays.asList("test1@example.com", "test2@example.com");
     final String delegates = wantDelegates.stream().collect(Collectors.joining(","));
@@ -43,6 +44,7 @@ public class ConnectionConfigTest {
 
     Properties props = new Properties();
     props.setProperty(ConnectionConfig.CLOUD_SQL_INSTANCE_PROPERTY, wantCsqlInstance);
+    props.setProperty(ConnectionConfig.CLOUD_SQL_NAMED_CONNECTION_PROPERTY, wantNamedConnection);
     props.setProperty(ConnectionConfig.CLOUD_SQL_TARGET_PRINCIPAL_PROPERTY, wantTargetPrincipal);
     props.setProperty(ConnectionConfig.CLOUD_SQL_DELEGATES_PROPERTY, delegates);
     props.setProperty(ConnectionConfig.ENABLE_IAM_AUTH_PROPERTY, iamAuthN);
@@ -55,6 +57,7 @@ public class ConnectionConfigTest {
     ConnectionConfig c = ConnectionConfig.fromConnectionProperties(props);
 
     assertThat(c.getCloudSqlInstance()).isEqualTo(wantCsqlInstance);
+    assertThat(c.getNamedConnection()).isEqualTo(wantNamedConnection);
     assertThat(c.getTargetPrincipal()).isEqualTo(wantTargetPrincipal);
     assertThat(c.getDelegates()).isEqualTo(wantDelegates);
     assertThat(c.getAuthType()).isEqualTo(AuthType.IAM);
@@ -68,6 +71,7 @@ public class ConnectionConfigTest {
   @Test
   public void testConfigFromBuilder() {
     final String wantCsqlInstance = "proj:region:inst";
+    final String wantNamedConnection = "my-connection";
     final String wantTargetPrincipal = "test@example.com";
     final List<String> wantDelegates = Arrays.asList("test1@example.com", "test2@example.com");
     final String wantUnixSocket = "/path/to/socket";
@@ -80,6 +84,7 @@ public class ConnectionConfigTest {
     ConnectionConfig c =
         new ConnectionConfig.Builder()
             .withCloudSqlInstance(wantCsqlInstance)
+            .withNamedConnection(wantNamedConnection)
             .withTargetPrincipal(wantTargetPrincipal)
             .withDelegates(wantDelegates)
             .withIpTypes(wantIpTypes)
@@ -91,6 +96,7 @@ public class ConnectionConfigTest {
             .build();
 
     assertThat(c.getCloudSqlInstance()).isEqualTo(wantCsqlInstance);
+    assertThat(c.getNamedConnection()).isEqualTo(wantNamedConnection);
     assertThat(c.getTargetPrincipal()).isEqualTo(wantTargetPrincipal);
     assertThat(c.getDelegates()).isEqualTo(wantDelegates);
     assertThat(c.getAuthType()).isEqualTo(wantAuthType);

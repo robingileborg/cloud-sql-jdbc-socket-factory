@@ -21,6 +21,7 @@ import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collections;
 import java.util.List;
+import java.util.Objects;
 import java.util.Properties;
 
 /**
@@ -30,6 +31,7 @@ import java.util.Properties;
 public class ConnectionConfig {
 
   public static final String CLOUD_SQL_INSTANCE_PROPERTY = "cloudSqlInstance";
+  public static final String CLOUD_SQL_NAMED_CONNECTION_PROPERTY = "cloudSqlNamedConnection";
   public static final String CLOUD_SQL_DELEGATES_PROPERTY = "cloudSqlDelegates";
   public static final String CLOUD_SQL_TARGET_PRINCIPAL_PROPERTY = "cloudSqlTargetPrincipal";
   public static final String CLOUD_SQL_ADMIN_ROOT_URL_PROPERTY = "cloudSqlAdminRootUrl";
@@ -43,6 +45,8 @@ public class ConnectionConfig {
       Arrays.asList(IpType.PUBLIC, IpType.PRIVATE);
   public static final AuthType DEFAULT_AUTH_TYPE = AuthType.PASSWORD;
   private final String cloudSqlInstance;
+
+  private final String namedConnection;
   private final String targetPrincipal;
   private final List<String> delegates;
   private final String unixSocketPath;
@@ -55,6 +59,9 @@ public class ConnectionConfig {
   /** Create a new ConnectionConfig from the well known JDBC Connection properties. */
   public static ConnectionConfig fromConnectionProperties(Properties props) {
     final String csqlInstanceName = props.getProperty(ConnectionConfig.CLOUD_SQL_INSTANCE_PROPERTY);
+    final String namedConnection =
+        props.getProperty(ConnectionConfig.CLOUD_SQL_NAMED_CONNECTION_PROPERTY);
+
     final String unixSocketPath = props.getProperty(ConnectionConfig.UNIX_SOCKET_PROPERTY);
     final AuthType authType =
         Boolean.parseBoolean(props.getProperty(ConnectionConfig.ENABLE_IAM_AUTH_PROPERTY))
@@ -81,6 +88,7 @@ public class ConnectionConfig {
         props.getProperty(ConnectionConfig.UNIX_SOCKET_PATH_SUFFIX_PROPERTY);
     return new ConnectionConfig(
         csqlInstanceName,
+        namedConnection,
         targetPrincipal,
         delegates,
         unixSocketPath,
@@ -114,8 +122,43 @@ public class ConnectionConfig {
     return result;
   }
 
+  @Override
+  public boolean equals(Object o) {
+    if (this == o) {
+      return true;
+    }
+    if (!(o instanceof ConnectionConfig)) {
+      return false;
+    }
+    ConnectionConfig config = (ConnectionConfig) o;
+    return Objects.equals(cloudSqlInstance, config.cloudSqlInstance)
+        && Objects.equals(namedConnection, config.namedConnection)
+        && Objects.equals(targetPrincipal, config.targetPrincipal)
+        && Objects.equals(delegates, config.delegates)
+        && Objects.equals(unixSocketPath, config.unixSocketPath)
+        && authType == config.authType
+        && Objects.equals(ipTypes, config.ipTypes)
+        && Objects.equals(adminRootUrl, config.adminRootUrl)
+        && Objects.equals(adminServicePath, config.adminServicePath);
+  }
+
+  @Override
+  public int hashCode() {
+    return Objects.hash(
+        cloudSqlInstance,
+        namedConnection,
+        targetPrincipal,
+        delegates,
+        unixSocketPath,
+        authType,
+        ipTypes,
+        adminRootUrl,
+        adminServicePath);
+  }
+
   private ConnectionConfig(
       String cloudSqlInstance,
+      String namedConnection,
       String targetPrincipal,
       List<String> delegates,
       String unixSocketPath,
@@ -125,6 +168,7 @@ public class ConnectionConfig {
       String adminServicePath,
       String unixSocketPathSuffix) {
     this.cloudSqlInstance = cloudSqlInstance;
+    this.namedConnection = namedConnection;
     this.targetPrincipal = targetPrincipal;
     this.delegates = delegates;
     this.unixSocketPath = unixSocketPath;
@@ -133,6 +177,10 @@ public class ConnectionConfig {
     this.adminRootUrl = adminRootUrl;
     this.adminServicePath = adminServicePath;
     this.unixSocketPathSuffix = unixSocketPathSuffix;
+  }
+
+  public String getNamedConnection() {
+    return namedConnection;
   }
 
   public String getCloudSqlInstance() {
@@ -175,6 +223,7 @@ public class ConnectionConfig {
   public static class Builder {
 
     private String cloudSqlInstance;
+    private String namedConnection;
     private String targetPrincipal;
     private List<String> delegates;
     private String unixSocketPath;
@@ -186,6 +235,11 @@ public class ConnectionConfig {
 
     public Builder withCloudSqlInstance(String cloudSqlInstance) {
       this.cloudSqlInstance = cloudSqlInstance;
+      return this;
+    }
+
+    public Builder withNamedConnection(String namedConnection) {
+      this.namedConnection = namedConnection;
       return this;
     }
 
@@ -209,13 +263,13 @@ public class ConnectionConfig {
       return this;
     }
 
-    /** Use ipTypes as a comma-delimited string. */
+    /** Set ipTypes with a comma-delimited string. */
     public Builder withIpTypes(String ipTypes) {
       this.ipTypes = listIpTypes(ipTypes);
       return this;
     }
 
-    /** Use ipTypes as a comma-delimited string. */
+    /** Set ipTypes as a list of IpType. */
     public Builder withIpTypes(List<IpType> ipTypes) {
       this.ipTypes = ipTypes;
       return this;
@@ -240,6 +294,7 @@ public class ConnectionConfig {
     public ConnectionConfig build() {
       return new ConnectionConfig(
           cloudSqlInstance,
+          namedConnection,
           targetPrincipal,
           delegates,
           unixSocketPath,
